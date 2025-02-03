@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>爱心雨</title>
+    <style>
+        body {
+            background-color: black;
+            margin: 0;
+            overflow: hidden;
+            position: relative;
+            cursor: pointer;
+        }
+        .heart {
+            position: absolute;
+            font-size: 20px;
+            color: red;
+            animation: floatUp 2s linear forwards;
+        }
+        @keyframes floatUp {
+            0% {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+            }
+            100% {
+                opacity: 0;
+                transform: translateY(-100px) scale(1.5);
+            }
+        }
+    </style>
+</head>
+<body onclick="createHeart(event)">
+
+<script>
+    function createHeart(event) {
+        const heart = document.createElement("div");
+        heart.classList.add("heart");
+        heart.innerHTML = "❤️";
+
+        const x = event.clientX;
+        const y = event.clientY;
+        const size = Math.random() * 20 + 10;
+        const color = `hsl(${Math.random() * 360}, 100%, 60%)`;
+
+        heart.style.left = `${x}px`;
+        heart.style.top = `${y}px`;
+        heart.style.fontSize = `${size}px`;
+        heart.style.color = color;
+        heart.style.position = "absolute";
+
+        document.body.appendChild(heart);
+
+        setTimeout(() => {
+            heart.remove();
+        }, 2000);
+    }
+</script>
+
+</body>
+</html>
