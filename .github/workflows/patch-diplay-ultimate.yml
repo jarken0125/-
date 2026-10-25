@@ -1,0 +1,74 @@
+name: Ultimate Patch DiPlay for K2001N
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  ultimate-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 拉取仓库与原版 diplay.apk
+        uses: actions/checkout@v4
+
+      - name: 2. 配置编译环境
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 3. 对原版 DiPlay 执行秒退修复、30帧锁定与音频不卡顿深度手术
+        run: |
+          APK_FILE=$(find . -maxdepth 1 -name "*.apk" | head -n 1)
+          echo "找到底包: $APK_FILE"
+          cp "$APK_FILE" input.apk
+
+          # 下载并安装 Apktool
+          curl -L -s https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -o apktool
+          curl -L -s https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o apktool.jar
+          chmod +x apktool
+
+          # 反编译原版 DiPlay
+          ./apktool d input.apk -o decoded -f
+
+          echo "=== [1/3] 根治秒退：精准清理 64位(arm64-v8a)等冗余库，仅保留全志T3 32位 armeabi-v7a ==="
+          rm -rf decoded/lib/arm64-v8a decoded/lib/x86 decoded/lib/x86_64
+
+          echo "=== [2/3] 适配车机：强制设定 Android 7.1.1 (API 24) 系统兼容性 ==="
+          sed -i "s/minSdkVersion: .*/minSdkVersion: '24'/g" decoded/apktool.yml
+
+          echo "=== [3/3] 融合 CarMore 内核：锁定 30 帧并放大音频解码防卡顿缓冲区 ==="
+          # 1. 资源文件帧率限制改为 30
+          if [ -d "decoded/res" ]; then
+            find decoded/res -name "*.xml" -exec sed -i 's/60/30/g' {} + 2>/dev/null || true
+          fi
+
+          # 2. 在 Smali 字节码中，将 10ms (0x2710) 音频短等待窗口放大至 500ms (0x7a120)，彻底消除听歌断流卡顿
+          if [ -d "decoded/smali" ]; then
+            find decoded/smali -name "*.smali" -exec sed -i 's/0x2710/0x7a120/g' {} + 2>/dev/null || true
+          fi
+
+          echo "=== 执行重新打包与 V1+V2 兼容签名 ==="
+          ./apktool b decoded -o unsigned.apk --use-aapt2
+
+          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name "zipalign" | sort -V | tail -n 1)
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -n 1)
+
+          "$ZIPALIGN" -p -f 4 unsigned.apk DiPlay-K2001N-Ultimate.apk
+
+          keytool -genkeypair -v -keystore k2001n.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias k2001n -storepass 123456 -keypass 123456 \
+            -dname "CN=K2001N, OU=CarPlay, O=Custom, L=CN, ST=CN, C=CN"
+
+          "$APKSIGNER" sign --ks k2001n.jks --ks-key-alias k2001n \
+            --ks-pass pass:123456 --key-pass pass:123456 \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            DiPlay-K2001N-Ultimate.apk
+
+          ls -lh DiPlay-K2001N-Ultimate.apk
+
+      - name: 4. 上传最终修补好的 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiPlay-K2001N-Ultimate-APK
+          path: DiPlay-K2001N-Ultimate.apk
