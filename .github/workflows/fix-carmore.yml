@@ -1,0 +1,72 @@
+name: Fix CarMore AutoStart
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  fix-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 读取你上传的 APK
+        uses: actions/checkout@v4
+
+      - name: 2. 清理64位库、消除多窗口弹窗、修复苹果USB自启动并签名
+        run: |
+          # 自动查找你仓库里上传的 .apk 文件（无论叫什么名字都能找到）
+          APK_FILE=$(find . -maxdepth 2 -name "*.apk" | head -n 1)
+          echo "找到上传的 APK 文件: $APK_FILE"
+          cp "$APK_FILE" input.apk
+
+          # 下载 Apktool
+          curl -L -s https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -o apktool
+          curl -L -s https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o apktool.jar
+          chmod +x apktool
+
+          # 反编译 APK
+          ./apktool d input.apk -o decoded -f
+
+          # 1. 删掉 64位 (arm64-v8a / x86_64) 冗余库，只留全志T3 32位 armeabi-v7a，大幅省内存
+          rm -rf decoded/lib/arm64-v8a decoded/lib/x86 decoded/lib/x86_64
+
+          # 2. 强制单实例模式 (singleTask)，彻底解决重复拉起多个窗口的问题
+          sed -i 's/android:launchMode="[^"]*"/android:launchMode="singleTask"/g' decoded/AndroidManifest.xml
+
+          # 3. 过滤 USB 设备表：只保留苹果 iPhone (vendor-id="1452")，屏蔽安卓有线(AOA)抢通道弹窗
+          if [ -d "decoded/res/xml" ]; then
+            for xmlfile in decoded/res/xml/*.xml; do
+              if grep -q "usb-device" "$xmlfile" 2>/dev/null; then
+                echo "正在精简 USB 过滤规则: $xmlfile"
+                cat << 'EOF' > "$xmlfile"
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <usb-device vendor-id="1452" />
+          </resources>
+          EOF
+              fi
+            done
+          fi
+
+          # 4. 重新打包并执行 V1 + V2 双重签名 (100% 兼容 Android 7.1.1 诺威达车机)
+          ./apktool b decoded -o fixed_unsigned.apk --use-aapt2
+          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name "zipalign" | sort -V | tail -n 1)
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -n 1)
+
+          "$ZIPALIGN" -p -f 4 fixed_unsigned.apk CarMore-K2001N-Perfect.apk
+
+          keytool -genkeypair -v -keystore cert.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias key0 -storepass 123456 -keypass 123456 \
+            -dname "CN=K2001N, OU=CarPlay, O=Custom, L=CN, ST=CN, C=CN"
+
+          "$APKSIGNER" sign --ks cert.jks --ks-key-alias key0 \
+            --ks-pass pass:123456 --key-pass pass:123456 \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            CarMore-K2001N-Perfect.apk
+
+          ls -lh CarMore-K2001N-Perfect.apk
+
+      - name: 3. 上传改好的完美版 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarMore-K2001N-Perfect-APK
+          path: CarMore-K2001N-Perfect.apk
