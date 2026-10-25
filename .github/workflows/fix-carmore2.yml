@@ -1,0 +1,125 @@
+name: Fix CarMore AutoStart
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  fix-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 读取你上传的 APK
+        uses: actions/checkout@v4
+
+      - name: 2. 彻底删光多余USB通道、只留唯一苹果通道并重新签名
+        run: |
+          APK_FILE=$(find . -maxdepth 2 -name "*.apk" | head -n 1)
+          echo "找到上传的 APK 文件: $APK_FILE"
+          cp "$APK_FILE" input.apk
+
+          # 下载 Apktool
+          curl -L -s https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -o apktool
+          curl -L -s https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o apktool.jar
+          chmod +x apktool
+
+          # 反编译 APK
+          ./apktool d input.apk -o decoded -f
+
+          # 1. 删掉 64位冗余库，只留全志T3 32位 armeabi-v7a
+          rm -rf decoded/lib/arm64-v8a decoded/lib/x86 decoded/lib/x86_64
+
+          # 2. 用 Python 精准清理 AndroidManifest.xml：
+          #    - 彻底删除所有 USB_ACCESSORY_ATTACHED (安卓AOA有线模式)
+          #    - 仅保留全包唯一 1 个 USB_DEVICE_ATTACHED (主Activity)，删掉其余所有争抢USB的弹窗组件
+          #    - 强制 singleTask 单窗口模式
+          python3 - << 'PYEOF'
+          import xml.etree.ElementTree as ET
+
+          manifest_path = "decoded/AndroidManifest.xml"
+          ET.register_namespace('android', 'http://schemas.android.com/apk/res/android')
+          tree = ET.parse(manifest_path)
+          root = tree.getroot()
+          ns = '{http://schemas.android.com/apk/res/android}'
+
+          app = root.find('application')
+          kept_usb_device = False
+
+          if app is not None:
+              for comp in list(app):
+                  # 强制 Activity 使用 singleTask 避免重复弹窗
+                  if comp.tag in ('activity', 'activity-alias'):
+                      comp.set(ns + 'launchMode', 'singleTask')
+
+                  # 检查组件下的 intent-filter
+                  has_kept_usb_in_this_comp = False
+                  for ifilter in list(comp.findall('intent-filter')):
+                      actions = [a.get(ns + 'name') for a in ifilter.findall('action')]
+                      
+                      # 1) 凡是包含 USB_ACCESSORY_ATTACHED (安卓有线配件)，直接移除动作或整个filter
+                      for a in list(ifilter.findall('action')):
+                          if a.get(ns + 'name') == 'android.hardware.usb.action.USB_ACCESSORY_ATTACHED':
+                              ifilter.remove(a)
+                      
+                      # 2) 处理 USB_DEVICE_ATTACHED：只留第一个，其余全部删掉
+                      for a in list(ifilter.findall('action')):
+                          if a.get(ns + 'name') == 'android.hardware.usb.action.USB_DEVICE_ATTACHED':
+                              if not kept_usb_device:
+                                  kept_usb_device = True
+                                  has_kept_usb_in_this_comp = True
+                              else:
+                                  ifilter.remove(a)
+                      
+                      # 如果该 intent-filter 里的 action 被删空了，直接把空的 intent-filter 删掉
+                      if len(ifilter.findall('action')) == 0:
+                          comp.remove(ifilter)
+
+                  # 清理组件下的 USB meta-data
+                  for meta in list(comp.findall('meta-data')):
+                      mname = meta.get(ns + 'name', '')
+                      if mname == 'android.hardware.usb.action.USB_ACCESSORY_ATTACHED':
+                          comp.remove(meta)
+                      elif mname == 'android.hardware.usb.action.USB_DEVICE_ATTACHED' and not has_kept_usb_in_this_comp:
+                          comp.remove(meta)
+
+          tree.write(manifest_path, encoding='utf-8', xml_declaration=True)
+          print("=== AndroidManifest.xml 多余 USB 通道已彻底清除，仅保留唯一苹果主通道 ===")
+          PYEOF
+
+          # 3. 过滤 res/xml 下所有 USB 配置文件：全部重写为仅含苹果 iPhone (vendor-id="1452")
+          if [ -d "decoded/res/xml" ]; then
+            for xmlfile in decoded/res/xml/*.xml; do
+              if grep -E -q "usb-device|usb-accessory" "$xmlfile" 2>/dev/null; then
+                echo "正在重写为纯苹果唯一通道: $xmlfile"
+                cat << 'EOF' > "$xmlfile"
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <usb-device vendor-id="1452" />
+          </resources>
+          EOF
+              fi
+            done
+          fi
+
+          # 4. 重新打包并执行 V1 + V2 签名
+          ./apktool b decoded -o fixed_unsigned.apk --use-aapt2
+          ZIPALIGN=$(find $ANDROID_HOME/build-tools -name "zipalign" | sort -V | tail -n 1)
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -n 1)
+
+          "$ZIPALIGN" -p -f 4 fixed_unsigned.apk CarMore-K2001N-AppleOnly.apk
+
+          keytool -genkeypair -v -keystore cert.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias key0 -storepass 123456 -keypass 123456 \
+            -dname "CN=K2001N, OU=CarPlay, O=Custom, L=CN, ST=CN, C=CN"
+
+          "$APKSIGNER" sign --ks cert.jks --ks-key-alias key0 \
+            --ks-pass pass:123456 --key-pass pass:123456 \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            CarMore-K2001N-AppleOnly.apk
+
+          ls -lh CarMore-K2001N-AppleOnly.apk
+
+      - name: 3. 上传纯苹果单通道完美版 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CarMore-K2001N-AppleOnly-APK
+          path: CarMore-K2001N-AppleOnly.apk
