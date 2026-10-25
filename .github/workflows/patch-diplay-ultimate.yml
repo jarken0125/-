@@ -17,15 +17,10 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 3. 精准定位原版 DiPlay 并注入 30帧流畅 + 4倍音乐缓冲补丁
+      - name: 3. 原版外壳无损替换 (专为 Android 7.1 车机打造，保留0压缩与035格式)
         run: |
-          # 只查找名字包含 diplay (不区分大小写) 的原版安装包，绝不误抓 CarMore！
           APK_FILE=$(find . -maxdepth 2 -iname "*diplay*.apk" | head -n 1)
-          if [ -z "$APK_FILE" ]; then
-            echo "❌ 错误：仓库里没有找到名字带 diplay 的原版安装包！请先把 DiPlay-0.2.21.apk 上传到仓库！"
-            exit 1
-          fi
-          echo "✅ 成功锁定原版底包: $APK_FILE"
+          echo "✅ 锁定原版底包: $APK_FILE"
           cp "$APK_FILE" input.apk
 
           # 下载 Apktool
@@ -33,19 +28,15 @@ jobs:
           curl -L -s https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar -o apktool.jar
           chmod +x apktool
 
-          # 核心关键：使用 -r 参数，100% 原封不动保留原版 AndroidManifest.xml (自启动) 与资源文件，绝不闪退！
+          # 解包提取 smali 代码
           ./apktool d -r input.apk -o decoded -f
 
-          # 清理 64位冗余库，只保留全志T3 32位 armeabi-v7a，释放车机内存
-          rm -rf decoded/lib/arm64-v8a decoded/lib/x86 decoded/lib/x86_64
+          # 【关键修复 1】强制锁定 API 21 (Android 5.0~7.1)，确保编译出的 classes.dex 为车机支持的 035 格式
+          sed -i "s/minSdkVersion: .*/minSdkVersion: '21'/g" decoded/apktool.yml
 
-          # 使用 Python 进行合法的 Smali 字节码指令级修改（彻底避免 cannot fit into a short 报错）
+          # 注入 4倍音频缓冲 + 解码超时防丢帧 + 30帧锁定
           python3 - << 'PYEOF'
           import os, re
-
-          audio_patched = 0
-          timeout_patched = 0
-          fps_patched = 0
 
           for root_dir, _, files in os.walk("decoded"):
               for fname in files:
@@ -54,49 +45,65 @@ jobs:
                   fpath = os.path.join(root_dir, fname)
                   with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
                       content = f.read()
-
                   orig = content
 
-                  # 1. 【解决放音乐卡顿】找到 AudioTrack.getMinBufferSize(III)I，将返回的音频缓冲区直接扩大 4 倍 (mul-int/lit8)
+                  # 1. 扩大 AudioTrack 音频硬件缓冲区 4 倍，解决放歌卡顿
                   if "Landroid/media/AudioTrack;->getMinBufferSize(III)I" in content:
                       pattern = r'(invoke-static(?:/range)?\s+\{[^}]+\},\s*Landroid/media/AudioTrack;->getMinBufferSize\(III\)I\s*\n(?:\s*\.line\s+\d+\s*\n|\s*\n)*\s*move-result\s+([vp]\d+))'
-                      def repl_audio(m):
-                          global audio_patched
-                          audio_patched += 1
-                          reg = m.group(2)
-                          return f"{m.group(1)}\n    mul-int/lit8 {reg}, {reg}, 0x4"
-                      content = re.sub(pattern, repl_audio, content)
+                      content = re.sub(pattern, lambda m: f"{m.group(1)}\n    mul-int/lit8 {m.group(2)}, {m.group(2)}, 0x4", content)
 
-                  # 2. 【解决音视频解码丢帧断流】仅在包含 MediaCodec 或 AudioTrack 的类中，将 16位超时指令合法升级为 32位 const-wide/32
+                  # 2. 扩大 MediaCodec / AudioTrack 解码等待窗口
                   if "Landroid/media/MediaCodec;" in content or "Landroid/media/AudioTrack;" in content:
-                      def repl_timeout(m):
-                          global timeout_patched
-                          timeout_patched += 1
-                          return f"{m.group(1)}const-wide/32 {m.group(2)}, 0x3d090"
-                      content = re.sub(r'^(\s*)const-wide/16\s+([vp]\d+),\s*0x(2710|1388|fa0)\b', repl_timeout, content, flags=re.M)
+                      content = re.sub(r'^(\s*)const-wide/16\s+([vp]\d+),\s*0x(2710|1388|fa0)\b', lambda m: f"{m.group(1)}const-wide/32 {m.group(2)}, 0x3d090", content, flags=re.M)
 
-                  # 3. 【锁定 30 帧流畅模式】在涉及视频帧率 (fps / frame-rate / video/avc) 的类中，将默认 60帧 (0x3c) 改为 30帧 (0x1e)
+                  # 3. 锁定默认 30 帧流畅模式
                   if any(k in content.lower() for k in ("fps", "frame-rate", "video/avc", "framerate")):
-                      def repl_fps(m):
-                          global fps_patched
-                          fps_patched += 1
-                          return f"{m.group(1)}const/16 {m.group(2)}, 0x1e"
-                      content = re.sub(r'^(\s*)const/16\s+([vp]\d+),\s*0x3c\b', repl_fps, content, flags=re.M)
+                      content = re.sub(r'^(\s*)const/16\s+([vp]\d+),\s*0x3c\b', lambda m: f"{m.group(1)}const/16 {m.group(2)}, 0x1e", content, flags=re.M)
 
                   if content != orig:
                       with open(fpath, "w", encoding="utf-8") as f:
                           f.write(content)
-
-          print(f"=== 补丁注入完成：音频4倍缓冲={audio_patched}处, 解码超时优化={timeout_patched}处, 30帧锁定={fps_patched}处 ===")
           PYEOF
 
-          echo "=== 重新回编译 APK 并执行 V1+V2 签名 ==="
-          ./apktool b decoded -o unsigned.apk
+          # 先用 apktool 生成修改后的 classes*.dex
+          ./apktool b decoded -o temp_dex.apk
 
+          # 【关键修复 2】直接基于原版 input.apk 进行无损 ZIP 替换：
+          # 100% 保留原版 AndroidManifest.xml 与资源，剔除 64位库，并强制 .so 库与 resources.arsc 为 0压缩 (ZIP_STORED)
+          python3 - << 'PYEOF'
+          import zipfile
+
+          with zipfile.ZipFile("temp_dex.apk", "r") as z_dex:
+              patched_dex = {name: z_dex.read(name) for name in z_dex.namelist() if name.startswith("classes") and name.endswith(".dex")}
+
+          with zipfile.ZipFile("input.apk", "r") as zin, zipfile.ZipFile("raw_repacked.apk", "w") as zout:
+              for item in zin.infolist():
+                  name = item.filename
+                  # 移除旧签名与 64位/x86 冗余库，只留 32位 armeabi-v7a
+                  if name.startswith(("META-INF/", "lib/arm64-v8a/", "lib/x86/", "lib/x86_64/")):
+                      continue
+                  
+                  info = zipfile.ZipInfo(filename=name, date_time=item.date_time)
+                  info.external_attr = item.external_attr
+
+                  if name in patched_dex:
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      zout.writestr(info, patched_dex[name])
+                  elif name.endswith(".so") or name == "resources.arsc":
+                      # 强制 0 压缩 (ZIP_STORED)，彻底解决 Android 7.1 车机拒装问题！
+                      info.compress_type = zipfile.ZIP_STORED
+                      zout.writestr(info, zin.read(name))
+                  else:
+                      info.compress_type = item.compress_type
+                      zout.writestr(info, zin.read(name))
+          print("✅ 原版外壳无损替换完成！")
+          PYEOF
+
+          # 4KB 边界对齐 + 强制 API 21 兼容 V1+V2 签名
           ZIPALIGN=$(find $ANDROID_HOME/build-tools -name "zipalign" | sort -V | tail -n 1)
           APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -n 1)
 
-          "$ZIPALIGN" -p -f 4 unsigned.apk DiPlay-K2001N-30FPS-Smooth.apk
+          "$ZIPALIGN" -p -f 4 raw_repacked.apk DiPlay-K2001N-30FPS-Smooth.apk
 
           keytool -genkeypair -v -keystore k2001n.jks -keyalg RSA -keysize 2048 -validity 10000 \
             -alias k2001n -storepass 123456 -keypass 123456 \
@@ -104,12 +111,11 @@ jobs:
 
           "$APKSIGNER" sign --ks k2001n.jks --ks-key-alias k2001n \
             --ks-pass pass:123456 --key-pass pass:123456 \
+            --min-sdk-version 21 \
             --v1-signing-enabled true --v2-signing-enabled true \
             DiPlay-K2001N-30FPS-Smooth.apk
 
-          ls -lh DiPlay-K2001N-30FPS-Smooth.apk
-
-      - name: 4. 上传最终修补好的原版 APK
+      - name: 4. 上传车机专版 APK
         uses: actions/upload-artifact@v4
         with:
           name: DiPlay-K2001N-30FPS-Smooth-APK
